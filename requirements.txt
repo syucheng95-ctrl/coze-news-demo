@@ -1,6 +1,5 @@
 streamlit
 cozepy
 edge-tts
-asyncio
-docx
+python-docx
 PyPDF2
