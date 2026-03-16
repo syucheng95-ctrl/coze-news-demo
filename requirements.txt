@@ -2,3 +2,5 @@ streamlit
 cozepy
 edge-tts
 asyncio
+docx
+PyPDF2
