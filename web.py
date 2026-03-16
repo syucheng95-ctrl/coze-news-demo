@@ -6,38 +6,86 @@ import edge_tts
 import tempfile
 import os
 from cozepy import Coze, TokenAuth, COZE_CN_BASE_URL
+import PyPDF2
+import docx
+
+
+def read_background_file(uploaded_file):
+    if uploaded_file is None:
+        return ""
+
+    file_name = uploaded_file.name.lower()
+    text = ""
+    try:
+        # Streamlit 上传的文件可以直接作为字节流被解析
+        if file_name.endswith('.txt'):
+            text = uploaded_file.getvalue().decode("utf-8")
+        elif file_name.endswith('.docx'):
+            doc = docx.Document(uploaded_file)
+            text = "\n".join([para.text for para in doc.paragraphs])
+        elif file_name.endswith('.pdf'):
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            for page in pdf_reader.pages:
+                if page.extract_text():
+                    text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as e:
+        st.error(f"⚠️ 文件读取失败: {e}")
+        return ""
 
 # ==========================================
-# 1. 核心配置与 API 初始化
+# 新增：尝试导入你之前用的离线语音识别库
 # ==========================================
+try:
+    from faster_whisper import WhisperModel
+
+    HAS_WHISPER = True
+except ImportError:
+    HAS_WHISPER = False
+
+# 注意：st.set_page_config 必须是第一个 Streamlit 命令
 st.set_page_config(page_title="创新创业大赛demo", page_icon="📰", layout="wide")
 
-# 最新的有效 Token (建议测试完毕后在Coze后台重置，避免泄露)
-NEW_TOKEN = st.secrets["COZE_TOKEN"]
+# ==========================================
+# 🚨 队友需要配置的变量区域 (请在此处填入你们自己的信息) 🚨
+# ==========================================
+
+# 1. Coze API Token
+COZE_API_TOKEN = st.secrets.get("COZE_TOKEN", "请替换为你的_COZE_API_TOKEN")
+
+# 2. Coze 工作流 IDs
+WORKFLOW_ID_HOST = "7617241168090316810"  # 【采访者】工作流 ID
+WORKFLOW_ID_INTERVIEWEE = "7617226472986902555"  # 【受访者】工作流 ID (后台原ID不变)
+WORKFLOW_ID_EDITOR = "7617244491765858342"  # 【初稿撰写】工作流 ID
+WORKFLOW_ID_REFINER = "7617247261945135156"  # 【打磨精修】工作流 ID
 
 WORKFLOWS = {
     "host": {
         "name": "采访者",
-        "token": NEW_TOKEN,
-        "id": "7617241168090316810"
+        "token": COZE_API_TOKEN,
+        "id": WORKFLOW_ID_HOST
     },
-    "lecun": {
-        "name": "Yann LeCun",
-        "token": NEW_TOKEN,
-        "id": "7617226472986902555"
+    "interviewee": {
+        "name": "受访者",
+        "token": COZE_API_TOKEN,
+        "id": WORKFLOW_ID_INTERVIEWEE
     },
     "editor": {
         "name": "初稿",
-        "token": NEW_TOKEN,
-        "id": "7617244491765858342"
+        "token": COZE_API_TOKEN,
+        "id": WORKFLOW_ID_EDITOR
     },
     "refiner": {
         "name": "修改",
-        "token": NEW_TOKEN,
-        "id": "7617247261945135156"
+        "token": COZE_API_TOKEN,
+        "id": WORKFLOW_ID_REFINER
     }
 }
 
+
+# ==========================================
+# 核心功能与 API 调用逻辑
+# ==========================================
 
 # 统一的 Coze 工作流调用函数
 def call_workflow(role_key, parameters):
@@ -61,31 +109,20 @@ def call_workflow(role_key, parameters):
 
 
 # ==========================================
-# 新增：本地 TTS 语音生成函数 (Edge-TTS)
+# TTS 本地语音生成函数 (Edge-TTS)
 # ==========================================
 def generate_audio_bytes(text, voice="zh-CN-XiaoxiaoNeural"):
-    """
-    将文本转换为音频流。
-    可选音色(voice)：
-    - 'zh-CN-YunxiNeural' (男声，干练，适合记者)
-    - 'zh-CN-XiaoxiaoNeural' (女声，清晰温暖)
-    """
-
     async def _generate():
         communicate = edge_tts.Communicate(text, voice)
-        # 创建一个临时文件来保存音频
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
             temp_path = fp.name
         await communicate.save(temp_path)
         return temp_path
 
     try:
-        # 运行异步函数
         temp_file_path = asyncio.run(_generate())
-        # 读取音频字节流用于 Streamlit 播放
         with open(temp_file_path, "rb") as f:
             audio_bytes = f.read()
-        # 读取完毕后立刻删除临时文件，防止占用硬盘
         os.remove(temp_file_path)
         return audio_bytes
     except Exception as e:
@@ -94,7 +131,40 @@ def generate_audio_bytes(text, voice="zh-CN-XiaoxiaoNeural"):
 
 
 # ==========================================
-# 2. 侧边栏：UI 设置 (全局字体与黑夜模式)
+# 新增：ASR 离线语音转文字 (Faster-Whisper)
+# 加了缓存装饰器，防止页面刷新重复加载模型卡死
+# ==========================================
+@st.cache_resource(show_spinner="⏳ 正在加载离线语音模型，请稍候...")
+def load_whisper_model():
+    if HAS_WHISPER:
+        return WhisperModel("base", device="cpu", compute_type="int8")
+    return None
+
+
+def transcribe_audio_input(audio_bytes):
+    if not HAS_WHISPER:
+        return "⚠️ 缺少 faster-whisper 库，无法识别。请在终端运行 pip install faster-whisper"
+
+    model = load_whisper_model()
+    if model is None:
+        return "⚠️ 模型加载失败。"
+
+    # 将前端传来的音频流写入临时文件供 Whisper 读取
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        tmp_file.write(audio_bytes.read())
+        tmp_path = tmp_file.name
+
+    try:
+        segments, _ = model.transcribe(tmp_path, beam_size=5)
+        text = "".join([segment.text for segment in segments])
+        return text.strip()
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# ==========================================
+# 2. 侧边栏：UI 设置
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 界面与排版设置")
@@ -123,11 +193,22 @@ with st.sidebar:
     </style>
     """
     st.markdown(custom_css, unsafe_allow_html=True)
+    st.divider()
+    st.header("📄 受访者背景资料")
+    uploaded_file = st.file_uploader("上传该干部的个人资料(如日记/生平)，AI将据此代入角色", type=["txt", "pdf", "docx"])
+
+    # 解析文件并存入全局状态
+    bg_text = read_background_file(uploaded_file)
+    if bg_text:
+        st.success(f"✅ 已成功读取资料，共 {len(bg_text)} 字。")
+        st.session_state.background_info = bg_text
+    else:
+        st.session_state.background_info = ""
 
 # ==========================================
 # 3. 网页 UI 布局与状态管理
 # ==========================================
-st.title("📰 智能 AI 编辑部：全自动采编发流水线")
+st.title("📰 智能 AI 采编系统：口述历史全自动流水线")
 st.caption("集成了全自动对话采访、深度成文与人工介入精修的端到端系统")
 
 if "chat_history" not in st.session_state:
@@ -138,6 +219,9 @@ if "draft_article" not in st.session_state:
     st.session_state.draft_article = ""
 if "current_article" not in st.session_state:
     st.session_state.current_article = ""
+# 新增：用于保存语音或键盘输入的修改意见
+if "feedback_text" not in st.session_state:
+    st.session_state.feedback_text = "标题不够抓人，请把核心金句加粗。"
 
 tab1, tab2, tab3 = st.tabs(["阶段一：访谈", "阶段二：撰稿", "阶段三：修改"])
 
@@ -150,7 +234,7 @@ with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
         initial_topic = st.text_input("给主持人设定一个初始提问：",
-                                      "杨教授，既然大语言模型已经能写代码了，为什么我们还要搞世界模型？")
+                                      "王书记，听说您当年主动申请去西藏扎根，能和我们分享一下当时的想法吗？")
     with col2:
         rounds = st.number_input("设置自动对谈回合数", min_value=1, max_value=10, value=3)
 
@@ -166,18 +250,22 @@ with tab1:
                 with st.chat_message("user", avatar="🎤"):
                     st.write(f"**主持人 (回合 {i + 1})**:\n{current_question}")
 
-                    # === 新增：在此处生成并播放主持人的语音 ===
                     with st.spinner("🎙️ 正在生成主持人语音..."):
                         audio_data = generate_audio_bytes(current_question)
                         if audio_data:
                             st.audio(audio_data, format="audio/mp3", autoplay=True)
 
-                with st.spinner(f"Yann LeCun 正在构思反击 (回合 {i + 1})..."):
-                    lecun_answer = call_workflow("lecun", {"input": current_question})
+                with st.spinner(f"受访者 正在构思回答 (回合 {i + 1})..."):
+                    # 把本地读到的背景资料，作为新变量一起打包发给 Coze
+                    api_params = {
+                        "input": current_question,
+                        "background_info": st.session_state.get("background_info", "")
+                    }
+                    interviewee_answer = call_workflow("interviewee", api_params)
 
-                with st.chat_message("assistant", avatar="🕶️"):
-                    st.write(f"**Yann LeCun**:\n{lecun_answer}")
-                st.session_state.chat_history.append({"role": "Yann LeCun", "content": lecun_answer})
+                with st.chat_message("assistant", avatar="👤"):
+                    st.write(f"**受访者**:\n{interviewee_answer}")
+                st.session_state.chat_history.append({"role": "受访者", "content": interviewee_answer})
 
                 if i < rounds - 1:
                     with st.spinner("主持人正在结合上下文生成追问..."):
@@ -185,7 +273,7 @@ with tab1:
                         for msg in st.session_state.chat_history:
                             history_context += f"{msg['role']}：{msg['content']}\n\n"
 
-                        prompt_for_host = f"以下是目前的完整访谈记录：\n{history_context}\n---\n请根据以上对话，特别是LeCun的最后回答，结合最初的议题，生成你下一个尖锐的追问（直接输出问题，不要寒暄和废话）："
+                        prompt_for_host = f"以下是目前的完整访谈记录：\n{history_context}\n---\n请根据以上对话，特别是受访者的最后回答，结合最初的议题，生成你下一个深度的追问（直接输出问题，不要寒暄和废话）："
 
                         next_question = call_workflow("host", {"input": prompt_for_host})
                         current_question = next_question
@@ -257,14 +345,39 @@ with tab3:
 
         st.divider()
 
-        feedback = st.text_area("💡 请输入给 AI 的修改意见 (Revision Feedback)：",
-                                "标题不够抓人，请把核心金句加粗。")
+        # ==========================================
+        # 新增：支持语音与键盘双输入的修改意见区
+        # ==========================================
+        st.subheader("💡 提供修改意见 (Revision Feedback)")
 
-        if st.button("让 AI 按意见精修当前版本"):
+        input_col1, input_col2 = st.columns([1, 1])
+        with input_col1:
+            # Streamlit 1.36+ 提供的原生音频输入组件
+            audio_val = st.audio_input("🎙️ 点击麦克风直接说出你的修改意见")
+            if audio_val is not None:
+                with st.spinner("🔄 正在将语音转为文字..."):
+                    asr_text = transcribe_audio_input(audio_val)
+                    if asr_text and not asr_text.startswith("⚠️"):
+                        st.session_state.feedback_text = asr_text
+                        st.success("识别成功！请在右侧核对。")
+                    else:
+                        st.warning(asr_text)
+
+        with input_col2:
+            # 文本输入框，它的值绑定到 session_state，这样语音识别后会自动填入这里
+            current_feedback = st.text_area(
+                "✍️ 键盘输入或核对语音识别结果：",
+                value=st.session_state.feedback_text,
+                height=120
+            )
+            # 实时同步用户手动修改的内容
+            st.session_state.feedback_text = current_feedback
+
+        if st.button("🚀 让 AI 按意见精修当前版本", type="primary", use_container_width=True):
             with st.spinner("Draft Refiner 正在根据您的意见重构当前文章..."):
                 final_article = call_workflow("refiner", {
                     "original_article": st.session_state.current_article,
-                    "revision_feedback": feedback,
+                    "revision_feedback": st.session_state.feedback_text,
                     "original_talk": st.session_state.transcript
                 })
 
